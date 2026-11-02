@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IP Whois from Screenshot</title>
+<style>
+:root{--bg:#0f1419;--card:#18202a;--line:#2a3644;--text:#e6edf3;--mut:#8b98a5;--acc:#4cc2ff;--ok:#3fb950;--warn:#d29922}
+@media (prefers-color-scheme: light){:root{--bg:#f6f8fa;--card:#fff;--line:#d0d7de;--text:#1f2328;--mut:#59636e;--acc:#0969da;--ok:#1a7f37;--warn:#9a6700}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+main{max-width:1100px;margin:0 auto;padding:24px 16px 60px}
+h1{font-size:22px;margin:0 0 4px}
+p.sub{color:var(--mut);margin:0 0 18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
+#drop{border:2px dashed var(--line);border-radius:10px;padding:28px;text-align:center;color:var(--mut);cursor:pointer}
+#drop.over{border-color:var(--acc);color:var(--acc)}
+textarea{width:100%;min-height:120px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:10px;font:13px/1.4 ui-monospace,Consolas,monospace}
+button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:8px 14px;font:inherit;cursor:pointer}
+button.sec{background:transparent;color:var(--text);border:1px solid var(--line)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+#status{color:var(--mut);font-size:13px}
+.tablewrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--mut);font-weight:600}
+td.ip{font-family:ui-monospace,Consolas,monospace}
+.tag{padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--line)}
+.tag.isp{color:var(--ok);border-color:var(--ok)}
+.tag.cdn{color:var(--acc);border-color:var(--acc)}
+.tag.err{color:var(--warn);border-color:var(--warn)}
+td.note{white-space:normal;min-width:180px;color:var(--mut)}
+#summary{margin:0 0 10px;color:var(--mut);font-size:13px}
+footer{color:var(--mut);font-size:12px;margin-top:20px}
+</style>
+</head>
+<body>
+<main>
+  <h1>IP Whois from Screenshot</h1>
+  <p class="sub">Drop, paste (Ctrl+V) or choose a screenshot of a domain / IP list. It reads the text, then shows the ASN, ISP and owner of each IP.</p>
+
+  <div class="card">
+    <div id="drop">Drop image here, paste a screenshot, or click to choose<input id="file" type="file" accept="image/*" multiple hidden></div>
+    <div class="row" style="margin-top:14px"><strong style="font-size:13px">Detected / pasted text (edit if OCR got a digit wrong):</strong></div>
+    <textarea id="txt" spellcheck="false" placeholder="www.tiktok.com 23.57.75.160&#10;v16-webapp.tiktok.com 116.68.211.147"></textarea>
+    <div class="row">
+      <button id="go">Look up</button>
+      <button class="sec" id="csv">Download CSV</button>
+      <button class="sec" id="md">Copy Markdown</button>
+      <span id="status"></span>
+    </div>
+  </div>
+
+  <div class="card" id="out" hidden>
+    <p id="summary"></p>
+    <div class="tablewrap"><table>
+      <thead><tr><th>#</th><th>Domain</th><th>IP</th><th>ASN</th><th>Org</th><th>ISP</th><th>CC</th><th>Type</th><th>Note</th></tr></thead>
+      <tbody id="body"></tbody>
+    </table></div>
+  </div>
+  <footer>Images are read in your browser (Tesseract.js). Only the IP addresses are sent to ipwho.is for the lookup. OCR can misread digits, so check the text box before trusting a result.</footer>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const DOMAIN_RE = /\b((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,})\b/i;
+const V4_RE = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
+const V6_RE = /\b(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}\b/gi;
+
+const NEPAL = {ncell:'Ncell',worldlink:'WorldLink',subisu:'Subisu',websurfer:'Websurfer','nepal telecommunications':'Nepal Telecom (NTC)',vianet:'Vianet','classic tech':'Classic Tech',dishhome:'DishHome','cg communications':'CG Net'};
+const CDN = {akamai:'Akamai (CDN)',fastly:'Fastly (CDN)',cloudflare:'Cloudflare (CDN)',google:'Google',amazon:'Amazon / AWS',microsoft:'Microsoft',bytedance:'ByteDance',facebook:'Meta','meta platforms':'Meta'};
+
+let rows = [];
+const cache = new Map();
+
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const validV4 = s => s.split('.').every(o => +o <= 255);
+const validV6 = s => { try { new URL('http://[' + s + ']'); return true; } catch { return false; } };
+
+function extractPairs(text){
+  const out = [];
+  for (const line of text.split(/\r?\n/)) {
+    let ip = (line.match(V4_RE) || []).find(validV4);
+    if (!ip) ip = (line.match(V6_RE) || []).find(x => (x.match(/:/g) || []).length >= 2 && validV6(x));
+    if (!ip) continue;
+    const d = line.match(DOMAIN_RE);
+    out.push({domain: d ? d[1].toLowerCase() : '?', ip});
+  }
+  return out;
+}
+
+async function lookup(ip){
+  if (cache.has(ip)) return cache.get(ip);
+  let r;
+  try {
+    const d = await (await fetch('https://ipwho.is/' + ip)).json();
+    if (d.success) {
+      const c = d.connection || {};
+      r = {asn: c.asn ? 'AS' + c.asn : '', org: c.org || '', isp: c.isp || '', country: d.country_code || ''};
+    } else r = {error: d.message || 'lookup failed'};
+  } catch (e) { r = {error: String(e.message || e)}; }
+  cache.set(ip, r);
+  return r;
+}
+
+function classify(domain, info){
+  const name = ((info.org || '') + ' ' + (info.isp || '')).toLowerCase();
+  for (const [k, label] of Object.entries(NEPAL)) {
+    if (name.includes(k)) {
+      const note = (domain !== '?' && !domain.includes(k)) ? `Hosted inside ${label} - likely CDN cache node` : '';
+      return {type: 'Local ISP (' + label + ')', cls: 'isp', note};
+    }
+  }
+  for (const [k, label] of Object.entries(CDN)) if (name.includes(k)) return {type: label, cls: 'cdn', note: ''};
+  if (info.country === 'NP') return {type: 'Nepal network', cls: 'isp', note: ''};
+  return {type: 'Other', cls: '', note: ''};
+}
+
+function render(){
+  $('#out').hidden = !rows.length;
+  $('#body').innerHTML = rows.map((r, i) => `<tr>
+    <td>${i + 1}</td><td>${esc(r.domain)}</td><td class="ip">${esc(r.ip)}</td>
+    <td>${esc(r.asn)}</td><td>${esc(r.org)}</td><td>${esc(r.isp)}</td><td>${esc(r.country)}</td>
+    <td>${r.type ? `<span class="tag ${r.cls}">${esc(r.type)}</span>` : (r.error ? '<span class="tag err">error</span>' : '...')}</td>
+    <td class="note">${esc(r.error || r.note)}</td></tr>`).join('');
+  const counts = {};
+  rows.forEach(r => { if (r.type) counts[r.type] = (counts[r.type] || 0) + 1; });
+  const uniq = new Set(rows.map(r => r.ip)).size;
+  $('#summary').textContent = `${rows.length} rows, ${uniq} unique IPs. ` +
+    Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} x${v}`).join(', ');
+}
+
+async function analyze(){
+  rows = extractPairs($('#txt').value).map(p => ({...p}));
+  if (!rows.length) { $('#status').textContent = 'No domain/IP pairs found.'; render(); return; }
+  $('#status').textContent = 'Looking up...';
+  render();
+  const queue = [...new Set(rows.map(r => r.ip))];
+  let done = 0;
+  const worker = async () => {
+    while (queue.length) {
+      const ip = queue.shift();
+      const info = await lookup(ip);
+      rows.filter(r => r.ip === ip).forEach(r => {
+        if (info.error) r.error = info.error;
+        else Object.assign(r, info, classify(r.domain, info));
+      });
+      $('#status').textContent = `Looked up ${++done} IPs`;
+      render();
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  $('#status').textContent = 'Done.';
+}
+
+let worker = null;
+async function getWorker(){
+  if (!worker) worker = await Tesseract.createWorker('eng', 1, {
+    logger: m => { if (m.status === 'recognizing text') $('#status').textContent = 'Reading image ' + Math.round(m.progress * 100) + '%'; }
+  });
+  return worker;
+}
+
+function canvasFrom(bmp, scale, box){
+  const b = box || {x: 0, y: 0, w: bmp.width, h: bmp.height};
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(b.w * scale)); c.height = Math.max(1, Math.round(b.h * scale));
+  const ctx = c.getContext('2d');
+  ctx.imageSmoothingQuality = 'high';
+  ctx.filter = 'grayscale(1) contrast(1.4)';
+  ctx.drawImage(bmp, b.x, b.y, b.w, b.h, 0, 0, c.width, c.height);
+  return c;
+}
+
+// Pass 1: find rows + domains. Pass 2: re-read each row's IP column on its own (digits only).
+async function ocrTable(file){
+  const w = await getWorker();
+  const bmp = await createImageBitmap(file);
+  const S = bmp.width > 1400 ? 1 : 2;
+  await w.setParameters({tessedit_pageseg_mode: '11', tessedit_char_whitelist: ''});
+  const {data} = await w.recognize(canvasFrom(bmp, S));
+  const words = (data.words || []).filter(x => x.text.trim()).map(x => ({
+    txt: x.text.trim(), l: x.bbox.x0, r: x.bbox.x1, t: x.bbox.y0, b: x.bbox.y1,
+    cy: (x.bbox.y0 + x.bbox.y1) / 2, h: x.bbox.y1 - x.bbox.y0}));
+  if (!words.length) return data.text || '';
+  words.sort((a, b) => a.cy - b.cy || a.l - b.l);
+  const hs = words.map(x => x.h).sort((a, b) => a - b);
+  const tol = hs[hs.length >> 1] * 0.6;
+  const lines = []; let cur = [], cy = null;
+  for (const x of words) {
+    if (cy === null || Math.abs(x.cy - cy) <= tol) { cur.push(x); cy = cur.reduce((s, y) => s + y.cy, 0) / cur.length; }
+    else { lines.push(cur); cur = [x]; cy = x.cy; }
+  }
+  if (cur.length) lines.push(cur);
+
+  const W = bmp.width * S, lefts = [];
+  for (const ln of lines) {
+    const n = ln.filter(x => /^[\d.:]{2,}$/.test(x.txt) && x.l > W * 0.45).map(x => x.l);
+    if (n.length) lefts.push(Math.min(...n));
+  }
+  lefts.sort((a, b) => a - b);
+  const colX = lefts.length ? lefts[lefts.length >> 1] - 8 : null;
+
+  await w.setParameters({tessedit_pageseg_mode: '7', tessedit_char_whitelist: '0123456789.:abcdef'});
+  const out = [];
+  for (const ln of lines) {
+    ln.sort((a, b) => a.l - b.l);
+    if (colX === null) { out.push(ln.map(x => x.txt).join(' ')); continue; }
+    const dom = ln.filter(x => x.l < colX).map(x => x.txt).join(' ');
+    const ipw = ln.filter(x => x.l >= colX - 4 && !(x.txt.length === 1 && !/\d/.test(x.txt)));
+    let ip = '';
+    if (ipw.length) {
+      const x0 = Math.max(0, Math.floor((colX - 4) / S));
+      const y0 = Math.max(0, Math.floor(Math.min(...ln.map(x => x.t)) / S) - 3);
+      const x1 = Math.min(bmp.width, Math.ceil(Math.max(...ipw.map(x => x.r)) / S) + 6);
+      const y1 = Math.min(bmp.height, Math.ceil(Math.max(...ln.map(x => x.b)) / S) + 3);
+      try {
+        const r = await w.recognize(canvasFrom(bmp, 4, {x: x0, y: y0, w: x1 - x0, h: y1 - y0}));
+        ip = (r.data.text || '').trim();
+      } catch (e) { /* fall back below */ }
+      if (!ip) ip = ipw.map(x => x.txt).join(' ');
+    }
+    out.push((dom + ' ' + ip).trim());
+  }
+  return out.join('\n').replace(/(\d)\.\s+(?=\d)/g, '$1.');
+}
+
+async function ocrFiles(files){
+  let all = $('#txt').value ? $('#txt').value + '\n' : '';
+  for (const f of files) {
+    if (!f.type.startsWith('image/')) continue;
+    $('#status').textContent = 'Reading image...';
+    try { all += (await ocrTable(f)) + '\n'; }
+    catch (e) { $('#status').textContent = 'OCR failed: ' + (e.message || e); return; }
+  }
+  $('#txt').value = all.trim();
+  await analyze();
+}
+
+const drop = $('#drop');
+drop.onclick = () => $('#file').click();
+$('#file').onchange = e => ocrFiles(e.target.files);
+drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
+drop.ondragleave = () => drop.classList.remove('over');
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); ocrFiles(e.dataTransfer.files); };
+document.addEventListener('paste', e => {
+  const files = [...(e.clipboardData?.files || [])];
+  if (files.length) ocrFiles(files);
+});
+$('#go').onclick = analyze;
+
+$('#csv').onclick = () => {
+  const cols = ['domain','ip','asn','org','isp','country','type','note'];
+  const q = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+  const csv = [cols.join(','), ...rows.map(r => cols.map(c => q(r[c])).join(','))].join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], {type: 'text/csv'}));
+  a.download = 'ip-whois.csv'; a.click();
+};
+$('#md').onclick = async () => {
+  const cols = ['domain','ip','asn','org','isp','country','type','note'];
+  const md = ['| # | ' + cols.join(' | ') + ' |', '|---|' + '---|'.repeat(cols.length),
+    ...rows.map((r, i) => `| ${i + 1} | ` + cols.map(c => r[c] ?? '').join(' | ') + ' |')].join('\n');
+  await navigator.clipboard.writeText(md);
+  $('#status').textContent = 'Markdown copied.';
+};
+</script>
+</body>
+</html>
